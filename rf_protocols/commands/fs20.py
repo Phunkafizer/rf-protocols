@@ -12,14 +12,17 @@ Devices which use FS20 include:
 - ELV FS20 S4 / S20 (Wall transmitters and remote controls)
 
 A standard FS20 command frame consists of:
-- Preamble 13 bits (0000000000001)
+- Preamble 12 bits (000000000000)
 - Sync bit: 1 bit (1)
 - Housecode high: 1 byte / 4 quaternary digits (values 1-4)
 - Housecode low: 1 byte / 4 quaternary digits (values 1-4)
 - Address: 1 byte / 4 quaternary digits (values 1-4) representing channel/key/group
 - Command: 1 byte / 4 quaternary digits specifying the action (e.g., Off, On, Dim, Timer).
 - Extension/Param: Optional 1 byte for extended commands (e.g., timer duration or dim level) if bit 5 is set in the Command byte.
-- Checksum: 1 byte Sum of all frame bytes modulo 256.
+- Checksum: 1 byte Sum of all frame bytes + 6 modulo 256.
+- Stop bit
+
+After every framebyte a parity bit (even) is inserted.
 
 The physical layer uses variable pulse-width encoding based on a time base t
 (typically a=200 µs):
@@ -32,8 +35,8 @@ The physical layer uses variable pulse-width encoding based on a time base t
              |<-3a->|<-3a->|
 
 References:
-- https://www.seegel-systeme.de/2017/03/28/uebersicht-funksteckdosen/
-- https://www.seegel-systeme.de/2015/09/05/funksteckdosen-mit-dem-raspberry-pi-steuern/
+- https://www.fhemwiki.de/wiki/FS20_Allgemein
+- https://www.seegel-systeme.de/2015/09/05/funksteckdosen-mit-dem-raspberry-pi-steuern
 """
 
 from __future__ import annotations
@@ -42,7 +45,6 @@ from typing import override, Optional, Union
 
 from . import ModulationType, RadioFrequencyCommand
 
-#_VALID_SYMBOLS = frozenset("01FX")
 _TIMEBASE = 200  # typical FS20 time base in microseconds
 
 class FS20CommandType(IntEnum):
@@ -103,8 +105,12 @@ class FS20Command(RadioFrequencyCommand):
 
         self.housecode = FS20Command._normalize_quaternary(housecode, 16, "housecode")
         self.address = FS20Command._normalize_quaternary(address, 8, "address")
+        if extension is not None:
+            if (extension < 0) or (extension > 255):
+                raise ValueError("extension must be within 0..255")
         self.extension = extension
         self.command = command
+
         super().__init__(
             frequency=frequency,
             modulation=ModulationType.OOK,
@@ -130,11 +136,11 @@ class FS20Command(RadioFrequencyCommand):
                 raise ValueError(f"{name} must be between 0 and { (1 << bits) - 1 }")
             return value
         else:
-            raise ValueError(f"{name} must be a string or integer")
+            raise TypeError(f"{name} must be a string or integer")
 
     @override
     def get_raw_timings(self) -> list[int]:
-        """Compute the FS20 frame timings followed by the sync symbol."""
+        """Compute the FS20 frame timings followed after preamble & sync"""
         symbols = {
             "0": [2 * self.timebase_us, -2 * self.timebase_us],
             "1": [3 * self.timebase_us, -3 * self.timebase_us],
@@ -145,7 +151,10 @@ class FS20Command(RadioFrequencyCommand):
         ba.append(self.housecode >> 8)
         ba.append(self.housecode & 0xFF)
         ba.append(self.address)
-        ba.append(self.command.value)
+        command_byte = self.command.value
+        if self.extension is not None:
+            command_byte |= 0x20 # extension bit
+        ba.append(command_byte)
         if self.extension is not None:
             ba.append(self.extension)
 
@@ -153,7 +162,7 @@ class FS20Command(RadioFrequencyCommand):
         cs: int = 0
         for b in ba:
             cs += b
-        cs &= 0xFF
+        cs = (cs + 0x06) & 0xFF
         ba.append(cs)
 
         for byte in ba:
@@ -163,6 +172,6 @@ class FS20Command(RadioFrequencyCommand):
         timings: list[int] = []
         for symbol in data:
             timings.extend(symbols[symbol])
-        timings[-1] = -10000 # pause
+        timings.extend([2 * self.timebase_us, -10000]) # stopbit
 
         return timings
